@@ -231,7 +231,7 @@ def test_metallib_path_named_in_package(tmp_path, monkeypatch):
     assert build.metallib_path("gdn_kern") == tmp_path / "gdn_kern.metallib"
 
 
-def test_metallib_digest_changes_with_source():
+def test_metallib_digest_changes_with_source(patched):
     # The metallib staleness stamp is keyed on the assembled shader source, so a
     # one-byte shader edit must change the digest (else an edited kernel loads
     # silently stale).
@@ -318,6 +318,7 @@ def stale_env(tmp_path, monkeypatch):
     monkeypatch.setattr(build, "_THIS_DIR", tmp_path)
     monkeypatch.setattr(build, "_input_hash", lambda: "SO_DIGEST")
     monkeypatch.setattr(build, "_metallib_source", lambda name: f"SRC::{name}")
+    monkeypatch.setattr(build, "_package_version", lambda name: "0.32.4")
     return tmp_path
 
 
@@ -336,11 +337,10 @@ def test_stale_artifacts_empty_when_all_fresh(stale_env):
     assert build.stale_artifacts() == []
 
 
-def test_prepare_metallib_is_independent_of_mlx(stale_env, monkeypatch):
+def test_prepare_metallib_does_not_import_mlx(stale_env, monkeypatch):
     _seed_fresh()
-    monkeypatch.setattr(
-        build, "_package_version", _raise(AssertionError("touched MLX"))
-    )
+    monkeypatch.setitem(sys.modules, "mlx", None)
+    monkeypatch.setitem(sys.modules, "mlx.core", None)
     name = build.METALLIB_NAMES[0]
     lib = build.metallib_path(name)
     assert build.prepare_metallib(name) == lib
@@ -361,7 +361,12 @@ def test_stale_artifacts_empty_without_stamps_skips_build_deps(stale_env, monkey
     monkeypatch.setattr(
         build, "_input_hash", _raise(AssertionError("touched build deps"))
     )
+    monkeypatch.setattr(
+        build, "_package_version", _raise(AssertionError("touched build deps"))
+    )
     assert build.stale_artifacts() == []
+    for name in build.METALLIB_NAMES:
+        assert build.prepare_metallib(name) == build.metallib_path(name)
 
 
 def test_stale_artifacts_flags_edited_so(stale_env):
@@ -667,6 +672,18 @@ def test_metallib_source_change_rebuilds(metallib_env):
     metallib_env["source"] = "// rope v2"
     build.build_metallibs()
     assert set(metallib_env["compiled"]) == {_LIB, "nax_fake"}
+
+
+def test_mlx_version_change_rebuilds_all_metallibs(patched, metallib_env):
+    build.build_metallibs()
+    metallib_env["compiled"].clear()
+    patched.versions["mlx"] = "99.0.0"
+
+    build.build_metallibs()
+    assert set(metallib_env["compiled"]) == {_LIB, "nax_fake"}
+    metallib_env["compiled"].clear()
+    build.build_metallibs()
+    assert metallib_env["compiled"] == []
 
 
 def test_metallib_toolchain_change_rebuilds(metallib_env):
