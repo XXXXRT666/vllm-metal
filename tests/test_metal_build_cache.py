@@ -242,11 +242,19 @@ def test_metallib_digest_changes_with_source(patched):
     )
 
 
-def test_nax_metallib_has_its_own_deployment_floor():
-    required = build._metallib_flags(build.METALLIB_NAMES[0])
-    nax = build._metallib_flags(build.NAX_METALLIB_NAME)
-    assert required[-1] == f"-mmacosx-version-min={build.MIN_MACOS_VERSION}"
-    assert nax[-1] == f"-mmacosx-version-min={build.NAX_MIN_MACOS_VERSION}"
+@pytest.mark.parametrize(
+    "name,target",
+    [
+        (build.METALLIB_NAMES[0], "MIN_MACOS_VERSION"),
+        (build.NAX_METALLIB_NAME, "NAX_MIN_MACOS_VERSION"),
+    ],
+)
+def test_metallib_digest_changes_with_deployment_target(
+    patched, monkeypatch, name, target
+):
+    digest = build._metallib_digest(name, "shader")
+    monkeypatch.setattr(build, target, "99.0")
+    assert build._metallib_digest(name, "shader") != digest
 
 
 def test_official_build_requires_nax_sdk(monkeypatch):
@@ -592,15 +600,23 @@ def test_mlx_build_preserves_configuration_and_restores_target(
         assert command.debug is None
         assert {name: os.environ[name] for name in settings} == settings
         assert os.environ["MACOSX_DEPLOYMENT_TARGET"] == build.MIN_MACOS_VERSION
+        assert {
+            library.name: library.deployment_target
+            for library in command.extensions[0].metal_libraries
+        } == {
+            _LIB: build.MIN_MACOS_VERSION,
+            build.NAX_METALLIB_NAME: build.NAX_MIN_MACOS_VERSION,
+        }
         if fail:
             raise RuntimeError("compiler failed")
 
     monkeypatch.setattr(extension.BuildExtension, "run", run)
+    sources = {_LIB: "// shader", build.NAX_METALLIB_NAME: "// nax shader"}
     if fail:
         with pytest.raises(RuntimeError, match="compiler failed"):
-            build._build_extension({_LIB: "// shader"}, tmp_path / "build")
+            build._build_extension(sources, tmp_path / "build")
     else:
-        build._build_extension({_LIB: "// shader"}, tmp_path / "build")
+        build._build_extension(sources, tmp_path / "build")
     assert {name: os.environ[name] for name in settings} == settings
     assert "MACOSX_DEPLOYMENT_TARGET" not in os.environ
 
@@ -684,7 +700,7 @@ def test_build_configuration_change_invalidates_all_artifacts(
     assert build.needs_rebuild() is True
     assert build.stale_artifacts() == []
     metallib_env["compiled"].clear()
-    build.build()
+    build.prepare_metallib(_LIB, build_from_source=True)
     assert set(metallib_env["compiled"]) == {_LIB, "nax_fake"}
     assert metallib_env["build_dirs"][-1] != original_dir
     assert build.needs_rebuild() is False
@@ -731,15 +747,38 @@ def test_debug_artifacts_load_without_build_environment(patched, compiler, monke
         assert build.prepare_metallib(name) == build.metallib_path(name)
 
 
-def test_mps_shader_rebuild_invalidates_mlx_configuration(metallib_env, monkeypatch):
-    build.build()
-    monkeypatch.setattr(build, "_run_or_raise", lambda *args: None)
-    build.prepare_metallib(_LIB, build_from_source=True)
-    assert build.stale_artifacts() == []
-    assert not build._metallib_is_current(_LIB, metallib_env["source"])
+@pytest.mark.parametrize("mps_first", [False, True], ids=["mlx-first", "mps-first"])
+@pytest.mark.parametrize("debug", ["0", "1"], ids=["release", "debug"])
+def test_mlx_and_mps_reuse_shared_metallibs(
+    patched, metallib_env, monkeypatch, mps_first, debug
+):
+    monkeypatch.setenv("DEBUG", debug)
+    monkeypatch.setattr(
+        build.subprocess,
+        "run",
+        _raise(AssertionError("unexpected standalone shader compiler")),
+    )
+    if mps_first:
+        build.prepare_metallib(_LIB, build_from_source=True)
+    else:
+        build.build()
+    assert set(metallib_env["compiled"]) == {_LIB, "nax_fake"}
+    artifacts = (
+        patched.out,
+        build.metallib_path(_LIB),
+        build.metallib_path("nax_fake"),
+    )
+    mtimes = [path.stat().st_mtime_ns for path in artifacts]
     metallib_env["compiled"].clear()
+
+    for name in (_LIB, "nax_fake"):
+        assert build.prepare_metallib(
+            name, build_from_source=True
+        ) == build.metallib_path(name)
+        assert build._metallib_is_current(name, metallib_env["source"])
     build.build()
-    assert metallib_env["compiled"] == [_LIB]
+    assert metallib_env["compiled"] == []
+    assert [path.stat().st_mtime_ns for path in artifacts] == mtimes
 
 
 def test_failed_build_invalidates_previous_configuration(metallib_env, monkeypatch):
@@ -748,7 +787,7 @@ def test_failed_build_invalidates_previous_configuration(metallib_env, monkeypat
     monkeypatch.setenv("DEBUG", "1")
     monkeypatch.setattr(build, "_build_extension", _raise(RuntimeError("build failed")))
     with pytest.raises(RuntimeError, match="build failed"):
-        build.build()
+        build.prepare_metallib(_LIB, build_from_source=True)
     monkeypatch.delenv("DEBUG")
     assert build.needs_rebuild() is True
     assert not build._metallib_is_current(_LIB, metallib_env["source"])
@@ -756,8 +795,9 @@ def test_failed_build_invalidates_previous_configuration(metallib_env, monkeypat
 
 @pytest.mark.parametrize("name", [_LIB, "nax_fake"])
 @pytest.mark.parametrize("host_changed", [False, True])
+@pytest.mark.parametrize("mps", [False, True], ids=["mlx", "mps"])
 def test_metallib_partial_hit_preserves_cached_library(
-    patched, metallib_env, monkeypatch, name, host_changed
+    patched, metallib_env, monkeypatch, name, host_changed, mps
 ):
     build.build_metallibs()
     metallib_env["compiled"].clear()
@@ -772,10 +812,15 @@ def test_metallib_partial_hit_preserves_cached_library(
     if host_changed:
         patched.src.write_bytes(b"// source v2")
 
-    assert build.build_metallibs() == [
-        build.metallib_path(_LIB),
-        build.metallib_path("nax_fake"),
-    ]
+    if mps:
+        assert build.prepare_metallib(
+            name, build_from_source=True
+        ) == build.metallib_path(name)
+    else:
+        assert build.build_metallibs() == [
+            build.metallib_path(_LIB),
+            build.metallib_path("nax_fake"),
+        ]
     assert metallib_env["compiled"] == [name]
     assert cached.read_bytes() == b"restored metallib"
     assert build.needs_rebuild() is False

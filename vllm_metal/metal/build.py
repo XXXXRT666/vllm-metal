@@ -81,18 +81,6 @@ def metallib_path(name: str) -> Path:
     return _THIS_DIR / f"{name}.metallib"
 
 
-# Stable parts of the metallib compile command (the per-build temp input and
-# output paths are appended in _compile_metallib). One constant so the actual
-# compile and the staleness digest agree on the flags. We mirror the flags MLX
-# uses to build its own shader libraries (share/cmake/MLX/extension.cmake:
-# ``MTLLIB_COMPILE_OPTIONS = -Wall -Wextra -fno-fast-math -Wno-c++17-extensions``;
-# the -W* flags only affect diagnostics). ``-fno-fast-math`` is the
-# numerics-critical one: the metal compiler defaults to fast-math ON, but MLX's
-# runtime ``newLibrary`` sets ``setFastMathEnabled(false)``, so without it the
-# precompiled kernels diverge from the in-process source compile. We deliberately
-# do NOT add ``-O3``: MLX compiles its shaders at the metal default optimization
-# (already enabled), so matching keeps the prebuilt path numerically and
-# behaviourally identical to what users get today.
 MIN_MACOS_VERSION = "15.0"
 NAX_MIN_MACOS_VERSION = "26.2"
 # Build inputs consumed by MetalExtension, CMake, and the host compiler.
@@ -106,22 +94,12 @@ _MLX_BUILD_ENV = (
     "SDKROOT",
     "DEVELOPER_DIR",
 )
-_METALLIB_BASE_FLAGS = ("xcrun", "-sdk", "macosx", "metal", "-fno-fast-math")
-_METALLIB_FLAGS = (
-    *_METALLIB_BASE_FLAGS,
-    f"-mmacosx-version-min={MIN_MACOS_VERSION}",
-)
-
 # MPP tensor ops need a 26.2 deployment floor at compile and link time.
 _NAX_MIN_SDK = tuple(int(x) for x in NAX_MIN_MACOS_VERSION.split("."))
-_NAX_METALLIB_FLAGS = (
-    *_METALLIB_BASE_FLAGS,
-    f"-mmacosx-version-min={NAX_MIN_MACOS_VERSION}",
-)
 
 
-def _metallib_flags(name: str) -> tuple[str, ...]:
-    return _NAX_METALLIB_FLAGS if name == NAX_METALLIB_NAME else _METALLIB_FLAGS
+def _metallib_deployment_target(name: str) -> str:
+    return NAX_MIN_MACOS_VERSION if name == NAX_METALLIB_NAME else MIN_MACOS_VERSION
 
 
 def _sdk_supports_nax() -> bool:
@@ -171,52 +149,18 @@ def _metallib_source(name: str) -> str:
 
 
 def _metallib_digest(name: str, source: str) -> str:
-    """Hash the assembled Metal source, compile flags, and MLX build version."""
+    """Hash the assembled source, deployment target, and MLX build version."""
     h = hashlib.sha256()
     h.update(f"mlx={_package_version('mlx')}\0".encode())
-    h.update("\0".join(_metallib_flags(name)).encode())
-    h.update(b"\0")
+    h.update(f"deployment_target={_metallib_deployment_target(name)}\0".encode())
     h.update(source.encode())
     return h.hexdigest()
 
 
-def _run_or_raise(cmd: list[str], what: str) -> None:
-    """Log and run a compiler command, raising with both streams on failure."""
-    logger.info("  %s", " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Failed to {what}:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-        )
-
-
-def _compile_metallib(name: str, source: str) -> Path:
-    """Compile Metal *source* to ``<name>.metallib`` in the package dir and write
-    its ``.sha256`` staleness stamp."""
-    out = metallib_path(name)
-    # This compiler path does not use MetalExtension's configuration.
-    _build_config_path(out).unlink(missing_ok=True)
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".metal", delete=False, dir=_THIS_DIR
-    )
-    try:
-        tmp.write(source)
-        tmp.close()
-        _run_or_raise(
-            [*_metallib_flags(name), tmp.name, "-o", str(out)],
-            f"compile Metal library '{name}'",
-        )
-    finally:
-        Path(tmp.name).unlink(missing_ok=True)
-    _stamp_path(out).write_text(_metallib_digest(name, source))
-    _toolchain_path(out).write_text(_metal_toolchain_id())
-    return out
-
-
 def prepare_metallib(name: str, *, build_from_source: bool = False) -> Path:
-    """Resolve one shader artifact without loading either framework's extension."""
+    """Rebuild if requested, then resolve a shared shader artifact."""
     if build_from_source:
-        return _compile_metallib(name, _metallib_source(name))
+        build_metallibs()
     path = metallib_path(name)
     if not path.exists():
         raise RuntimeError(
@@ -285,7 +229,7 @@ def _read_strict(path: Path) -> str | None:
 
 def _metallib_is_current(name: str, source: str) -> bool:
     """Build-side skip gate: the library exists, its ``.sha256`` stamp matches
-    the source, flags, and MLX version, and its build configuration and Metal
+    the source, deployment target, and MLX version, and its configuration and Metal
     toolchain match. Stricter than the runtime :func:`is_stale` on purpose:
     an unreadable build record means rebuild."""
     path = metallib_path(name)
@@ -315,11 +259,7 @@ def _build_extension(sources: dict[str, str], build_dir: Path) -> None:
             MetalLibrary(
                 name,
                 sources=[str(path)],
-                deployment_target=(
-                    NAX_MIN_MACOS_VERSION
-                    if name == NAX_METALLIB_NAME
-                    else MIN_MACOS_VERSION
-                ),
+                deployment_target=_metallib_deployment_target(name),
             )
         )
     extension = MetalExtension(
