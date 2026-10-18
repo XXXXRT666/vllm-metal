@@ -1522,6 +1522,13 @@ array paged_attention_primitive_fn(
           "); an understated value leaves window rows unwritten");
     }
   }
+  if (use_turboquant &&
+      (key_scale_cache == nullptr || value_scale_cache == nullptr ||
+       key_zero_cache == nullptr || v_centroids == nullptr)) {
+    throw std::invalid_argument(
+        "TurboQuant requires key_scale_cache, value_scale_cache, "
+        "key_zero_cache, and v_centroids");
+  }
   int k_bits = use_turboquant ? get_bits(quant_type) : 8;
   auto prim = std::make_shared<PagedAttentionPrimitive>(
       default_stream(Device::gpu),
