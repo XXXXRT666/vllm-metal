@@ -334,7 +334,7 @@ def test_turboquant_512_head_dim_matches_python_reference() -> None:
     attn_scale = 1.0 / math.sqrt(head_dim)
     v_centroids = get_v_centroids(cache.v_bits)
     ops = get_ops()
-    ops.paged_attention_primitive(
+    out_metal = ops.paged_attention_primitive(
         q,
         cache.key_caches[0],
         cache.value_caches[0],
@@ -347,7 +347,6 @@ def test_turboquant_512_head_dim_matches_python_reference() -> None:
         block_size,
         num_tokens,
         -1,
-        out_metal,
         key_scale_cache=cache.key_scale_caches[0],
         value_scale_cache=cache.value_scale_caches[0],
         key_zero_cache=cache.key_zero_caches[0],
